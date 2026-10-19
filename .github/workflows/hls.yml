@@ -1,0 +1,93 @@
+name: HLS çevir ve kutulara yayınla
+run-name: ${{ inputs.video || format('kutu {0}', inputs.kutu) }}
+
+# Sadece elle ya da panelden başlatılır (POST /repos/{repo}/actions/workflows/hls.yml/dispatches).
+# Kayıt yeri panel (D1); Actions panelle GitHub OIDC ile konuşur. Ayrıntı: web/API.md
+# Her video çevrilir çevrilmez kutusuna (Pages projesi) yayınlanır; GitHub'da HLS paketi tutulmaz.
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "kaynak release'indeki dosya adı ya da parçaların ortak adı (boş: kutuda olmayan tek dosyalık kaynakların hepsi)"
+        required: false
+        default: ""
+      mod:
+        description: "auto | copy | encode"
+        required: false
+        default: auto
+      yeniden:
+        description: "Kutuda olsa bile yeniden üret"
+        type: boolean
+        required: false
+        default: false
+      kutu:
+        description: "Ayrıca yeniden yayınlanacak kutular: '1 3' ya da 'hepsi'"
+        required: false
+        default: ""
+
+concurrency:
+  group: hls-yayin
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  PANEL_ADRES: ${{ vars.PANEL_ADRES }}
+
+jobs:
+  donustur:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - name: Panel adresi
+        run: |
+          if [ -z "$PANEL_ADRES" ]; then
+            echo "::error::PANEL_ADRES repo değişkeni boş. Panel bu repoyu GitHub bağlantısı olarak eklerken yazar; paneldeki bağlantıyı kontrol edin."
+            exit 1
+          fi
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Pages yükleme araçları
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pages-npm" --no-audit --no-fund --loglevel=error blake3-wasm@2.1.5 mime@3.0.0
+          echo "PAGES_NPM=$RUNNER_TEMP/pages-npm" >> "$GITHUB_ENV"
+      - name: ffmpeg
+        if: ${{ inputs.video != '' || inputs.kutu == '' }}   # sadece kutu yayınıysa gerekmez
+        run: command -v ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+      - name: Çevir ve yayınla
+        id: cevir
+        env:
+          VIDEO: ${{ inputs.video }}
+          KUTU: ${{ inputs.kutu }}
+          MOD: ${{ inputs.mod }}
+          YENIDEN: ${{ inputs.yeniden }}
+        run: bash scripts/donustur.sh
+      # Dönüştürme kısmen başarısız olsa da istenen kutular yeniden yayınlanır.
+      - name: Kutuları yeniden yayınla
+        if: ${{ !cancelled() && inputs.kutu != '' && vars.PANEL_ADRES != '' }}
+        env:
+          KUTULAR: ${{ inputs.kutu }}
+          YAPILDI: ${{ steps.cevir.outputs.kutular }}
+        run: bash scripts/yayinla-ci.sh
+
+  hata:
+    needs: donustur
+    if: ${{ failure() && vars.PANEL_ADRES != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Panele bildir
+        env:
+          VIDEO: ${{ inputs.video }}
+        run: |
+          . scripts/panel.sh
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          panel POST /api/ci/hata "$(jq -nc --argjson run_id "$GITHUB_RUN_ID" --arg video "$VIDEO" \
+            --arg mesaj "İş başarısız: $url" '{run_id: $run_id, video: $video, mesaj: $mesaj}')"
